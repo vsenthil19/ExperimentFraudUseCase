@@ -71,13 +71,13 @@ public class FraudDetectionHandler implements RequestHandler<APIGatewayProxyRequ
         this.riskScoringEngine = new RiskScoringEngine(amountScorer, copScorer, behaviouralScorer, channelScorer);
 
         // Create DynamoDB repositories
-        DynamoDbClient dynamoDbClient = DynamoDbClient.create();
+        DynamoDbClient dynamoDbClient = createDynamoDbClient();
         DynamoDbConfig dynamoDbConfig = new DynamoDbConfig(dynamoDbClient);
         this.customerProfileRepository = new DynamoDbCustomerProfileRepository(dynamoDbConfig);
         this.beneficiaryRegistryRepository = new DynamoDbBeneficiaryRegistryRepository(dynamoDbConfig);
 
         // Create EventBridge publisher
-        EventBridgeClient eventBridgeClient = EventBridgeClient.create();
+        EventBridgeClient eventBridgeClient = createEventBridgeClient();
         this.eventPublisher = new EventBridgeEventPublisher(eventBridgeClient);
     }
 
@@ -341,5 +341,39 @@ public class FraudDetectionHandler implements RequestHandler<APIGatewayProxyRequ
             .withStatusCode(statusCode)
             .withHeaders(Map.of("Content-Type", "application/json"))
             .withBody("{\"error\":\"" + message + "\"}");
+    }
+
+    /**
+     * Creates a DynamoDB client, respecting AWS_ENDPOINT_URL for LocalStack compatibility.
+     */
+    private static DynamoDbClient createDynamoDbClient() {
+        String endpointUrl = System.getenv("AWS_ENDPOINT_URL");
+        if (endpointUrl != null && !endpointUrl.isBlank()) {
+            return DynamoDbClient.builder()
+                .endpointOverride(java.net.URI.create(endpointUrl))
+                .credentialsProvider(software.amazon.awssdk.auth.credentials.StaticCredentialsProvider.create(
+                    software.amazon.awssdk.auth.credentials.AwsBasicCredentials.create(
+                        System.getenv().getOrDefault("AWS_ACCESS_KEY_ID", "test"),
+                        System.getenv().getOrDefault("AWS_SECRET_ACCESS_KEY", "test"))))
+                .build();
+        }
+        return DynamoDbClient.create();
+    }
+
+    /**
+     * Creates an EventBridge client, respecting AWS_ENDPOINT_URL for LocalStack compatibility.
+     */
+    private static EventBridgeClient createEventBridgeClient() {
+        String endpointUrl = System.getenv("AWS_ENDPOINT_URL");
+        if (endpointUrl != null && !endpointUrl.isBlank()) {
+            return EventBridgeClient.builder()
+                .endpointOverride(java.net.URI.create(endpointUrl))
+                .credentialsProvider(software.amazon.awssdk.auth.credentials.StaticCredentialsProvider.create(
+                    software.amazon.awssdk.auth.credentials.AwsBasicCredentials.create(
+                        System.getenv().getOrDefault("AWS_ACCESS_KEY_ID", "test"),
+                        System.getenv().getOrDefault("AWS_SECRET_ACCESS_KEY", "test"))))
+                .build();
+        }
+        return EventBridgeClient.create();
     }
 }
