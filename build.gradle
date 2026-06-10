@@ -128,3 +128,14 @@ tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
     options.compilerArgs += ['-parameters']
 }
+
+// Build a Lambda deployment zip with all dependencies
+tasks.register('buildLambdaZip', Zip) {
+    from compileJava
+    from processResources
+    into('lib') {
+        from configurations.runtimeClasspath
+    }
+    archiveFileName = 'fraud-detection-lambda.zip'
+    destinationDirectory = file("$buildDir/distributions")
+}
