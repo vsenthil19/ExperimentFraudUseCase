@@ -110,6 +110,13 @@ class DevHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(response_body)
+
+                # After successful fraud-check, simulate EventBridge delivery
+                # by directly invoking the AuditLogHandler Lambda.
+                # (LocalStack CE doesn't reliably deliver EventBridge→Lambda/SQS)
+                if self.path == "/fraud-check" and resp.status == 200:
+                    self._trigger_audit_handler(body, response_body)
+
         except urllib.error.HTTPError as e:
             response_body = e.read()
             self.send_response(e.code)
@@ -129,6 +136,107 @@ class DevHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps({"error": str(e)}).encode())
+
+    def _trigger_audit_handler(self, request_body, response_body):
+        """Simulate the AuditLogHandler by writing the decision audit record
+        directly to DynamoDB. This works around LocalStack CE's limitations
+        with EventBridge targets and Lambda credential propagation."""
+        import threading
+        def _write_audit():
+            try:
+                request_data = json.loads(request_body)
+                response_data = json.loads(response_body)
+                message_id = response_data.get("messageId", "")
+                decision = response_data.get("decision", "")
+                timestamp = response_data.get("timestamp", "")
+                risk_score = response_data.get("riskScore", 0)
+                breakdown = response_data.get("breakdown", {})
+                risk_factors = response_data.get("riskFactors", [])
+
+                debtor = request_data.get("debtorAccount", {})
+                creditor = request_data.get("creditorAccount", {})
+
+                # Build DynamoDB item matching DecisionAuditEntity schema
+                item = {
+                    "pk": {"S": f"AUDIT#{message_id}"},
+                    "sk": {"S": "DECISION"},
+                    "timestamp": {"S": timestamp},
+                    "debtorAccount": {"S": f"{debtor.get('sortCode','')}#{debtor.get('accountNumber','')}"},
+                    "creditorAccount": {"S": f"{creditor.get('sortCode','')}#{creditor.get('accountNumber','')}"},
+                    "amount": {"N": str(request_data.get("amount", 0))},
+                    "riskScore": {"N": str(risk_score)},
+                    "decision": {"S": decision},
+                    "amountScore": {"N": str(breakdown.get("amountScore", 0))},
+                    "copScore": {"N": str(breakdown.get("copScore", 0))},
+                    "behaviouralScore": {"N": str(breakdown.get("behaviouralScore", 0))},
+                    "channelScore": {"N": str(breakdown.get("channelScore", 0))},
+                    "gsiPk": {"S": f"DECISION#{decision}"},
+                    "gsiSk": {"S": timestamp}
+                }
+
+                # Add risk factors and explanations as string lists
+                if risk_factors:
+                    item["riskFactors"] = {"L": [{"S": rf.get("category", "")} for rf in risk_factors]}
+                    item["explanations"] = {"L": [{"S": rf.get("explanation", "")} for rf in risk_factors]}
+
+                # Write to DynamoDB
+                import subprocess
+                result = subprocess.run(
+                    ["aws", "--endpoint-url=http://localhost:4566", "--region", "us-east-1",
+                     "dynamodb", "put-item",
+                     "--table-name", "FraudDetection",
+                     "--item", json.dumps(item)],
+                    capture_output=True, text=True, timeout=10,
+                    env={**os.environ, "AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test"}
+                )
+
+                if result.returncode == 0:
+                    sys.stderr.write(f"[Audit] ✓ Persisted decision for {message_id} ({decision})\n")
+                else:
+                    sys.stderr.write(f"[Audit] ✗ DynamoDB write failed: {result.stderr[:200]}\n")
+
+                # Also write to S3 (archive)
+                import tempfile
+                archive_data = json.dumps({
+                    "messageId": message_id,
+                    "timestamp": timestamp,
+                    "debtorAccount": debtor,
+                    "creditorAccount": creditor,
+                    "amount": request_data.get("amount", 0),
+                    "riskScore": risk_score,
+                    "decision": decision,
+                    "breakdown": breakdown,
+                    "riskFactors": risk_factors
+                })
+
+                # S3 key: decisions/{year}/{month}/{day}/{messageId}.json
+                date_parts = timestamp[:10].split("-") if timestamp else ["2026", "01", "01"]
+                s3_key = f"decisions/{date_parts[0]}/{date_parts[1]}/{date_parts[2]}/{message_id}.json"
+
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+                    f.write(archive_data)
+                    tmp_path = f.name
+
+                s3_result = subprocess.run(
+                    ["aws", "--endpoint-url=http://localhost:4566", "--region", "us-east-1",
+                     "s3api", "put-object",
+                     "--bucket", "fraud-audit-archive",
+                     "--key", s3_key,
+                     "--body", tmp_path,
+                     "--content-type", "application/json"],
+                    capture_output=True, text=True, timeout=10,
+                    env={**os.environ, "AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test"}
+                )
+                os.unlink(tmp_path)
+
+                if s3_result.returncode == 0:
+                    sys.stderr.write(f"[Audit] ✓ Archived to S3: {s3_key}\n")
+
+            except Exception as e:
+                sys.stderr.write(f"[Audit] Error: {e}\n")
+
+        # Run async so we don't block the HTTP response
+        threading.Thread(target=_write_audit, daemon=True).start()
 
     def _add_cors_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")

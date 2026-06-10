@@ -192,7 +192,7 @@ sudo docker run -d \
   --rm \
   -p 4566:4566 \
   -p 4510-4559:4510-4559 \
-  -e SERVICES=dynamodb,lambda,apigateway,events,iam,s3,sts \
+  -e SERVICES=dynamodb,lambda,apigateway,events,iam,s3,sqs,sts \
   -e LAMBDA_EXECUTOR=local \
   -e DOCKER_HOST=unix:///var/run/docker.sock \
   -v /var/run/docker.sock:/var/run/docker.sock \
@@ -215,158 +215,51 @@ for i in $(seq 1 30); do
 done
 
 ###############################################################################
-# STEP 4: Create DynamoDB table
+# STEP 4: Deploy all AWS resources
 ###############################################################################
-print_step 4 "Deploying DynamoDB table"
+print_step 4 "Deploying full stack to LocalStack"
 
-aws --endpoint-url=$ENDPOINT dynamodb create-table \
-  --table-name "$TABLE_NAME" \
-  --key-schema \
-    AttributeName=pk,KeyType=HASH \
-    AttributeName=sk,KeyType=RANGE \
-  --attribute-definitions \
-    AttributeName=pk,AttributeType=S \
-    AttributeName=sk,AttributeType=S \
-    AttributeName=gsiPk,AttributeType=S \
-    AttributeName=gsiSk,AttributeType=S \
-  --global-secondary-indexes '[{
-    "IndexName": "DecisionAuditGSI",
-    "KeySchema": [
-      {"AttributeName": "gsiPk", "KeyType": "HASH"},
-      {"AttributeName": "gsiSk", "KeyType": "RANGE"}
-    ],
-    "Projection": {"ProjectionType": "ALL"}
-  }]' \
-  --billing-mode PAY_PER_REQUEST \
-  --no-cli-pager >/dev/null 2>&1 || echo "  (table already exists)"
-
-echo "✓ DynamoDB table: $TABLE_NAME"
+bash "$PROJECT_ROOT/localstack/deploy.sh"
 
 ###############################################################################
-# STEP 5: Create EventBridge bus and deploy Lambda
+# STEP 5: Seed test data
 ###############################################################################
-print_step 5 "Deploying EventBridge + Lambda"
+print_step 5 "Seeding test data"
 
-# EventBridge
-aws --endpoint-url=$ENDPOINT events create-event-bus \
-  --name "$EVENT_BUS_NAME" \
-  --no-cli-pager >/dev/null 2>&1 || echo "  (event bus already exists)"
-echo "✓ EventBridge bus: $EVENT_BUS_NAME"
-
-# Lambda (delete existing first for clean redeploy)
-aws --endpoint-url=$ENDPOINT lambda delete-function \
-  --function-name "$LAMBDA_NAME" 2>/dev/null || true
-
-aws --endpoint-url=$ENDPOINT lambda create-function \
-  --function-name "$LAMBDA_NAME" \
-  --runtime java17 \
-  --handler "com.frauddetection.handler.FraudDetectionHandler::handleRequest" \
-  --role "arn:aws:iam::000000000000:role/lambda-role" \
-  --zip-file "fileb://$LAMBDA_ZIP" \
-  --timeout 30 \
-  --memory-size 512 \
-  --environment "Variables={FRAUD_DETECTION_TABLE=$TABLE_NAME,EVENT_BUS_NAME=$EVENT_BUS_NAME,AWS_REGION=$REGION}" \
-  --no-cli-pager >/dev/null
-
-echo "✓ Lambda function: $LAMBDA_NAME (java17, 512MB)"
+bash "$PROJECT_ROOT/localstack/seed-data.sh"
 
 ###############################################################################
-# STEP 6: Create API Gateway
+# STEP 6: Smoke test
 ###############################################################################
-print_step 6 "Deploying API Gateway"
+print_step 6 "Running smoke test"
 
-LAMBDA_ARN="arn:aws:lambda:$REGION:000000000000:function:$LAMBDA_NAME"
-
-# Delete existing API if present
-EXISTING_APIS=$(aws --endpoint-url=$ENDPOINT apigateway get-rest-apis \
-  --query "items[?name=='$API_NAME'].id" --output text 2>/dev/null || echo "")
-for api_id in $EXISTING_APIS; do
-  aws --endpoint-url=$ENDPOINT apigateway delete-rest-api \
-    --rest-api-id "$api_id" 2>/dev/null || true
-done
-
-# Create REST API
-API_ID=$(aws --endpoint-url=$ENDPOINT apigateway create-rest-api \
-  --name "$API_NAME" \
-  --query 'id' --output text)
-
-# Get root resource
-ROOT_ID=$(aws --endpoint-url=$ENDPOINT apigateway get-resources \
-  --rest-api-id "$API_ID" \
-  --query 'items[?path==`/`].id' --output text)
-
-# /fraud-check endpoint
-FRAUD_CHECK_ID=$(aws --endpoint-url=$ENDPOINT apigateway create-resource \
-  --rest-api-id "$API_ID" \
-  --parent-id "$ROOT_ID" \
-  --path-part "fraud-check" \
-  --query 'id' --output text)
-
-aws --endpoint-url=$ENDPOINT apigateway put-method \
-  --rest-api-id "$API_ID" \
-  --resource-id "$FRAUD_CHECK_ID" \
-  --http-method POST \
-  --authorization-type NONE \
-  --no-cli-pager >/dev/null
-
-aws --endpoint-url=$ENDPOINT apigateway put-integration \
-  --rest-api-id "$API_ID" \
-  --resource-id "$FRAUD_CHECK_ID" \
-  --http-method POST \
-  --type AWS_PROXY \
-  --integration-http-method POST \
-  --uri "arn:aws:apigateway:$REGION:lambda:path/2015-03-31/functions/$LAMBDA_ARN/invocations" \
-  --no-cli-pager >/dev/null
-
-# /confirm-payment endpoint
-CONFIRM_ID=$(aws --endpoint-url=$ENDPOINT apigateway create-resource \
-  --rest-api-id "$API_ID" \
-  --parent-id "$ROOT_ID" \
-  --path-part "confirm-payment" \
-  --query 'id' --output text)
-
-aws --endpoint-url=$ENDPOINT apigateway put-method \
-  --rest-api-id "$API_ID" \
-  --resource-id "$CONFIRM_ID" \
-  --http-method POST \
-  --authorization-type NONE \
-  --no-cli-pager >/dev/null
-
-aws --endpoint-url=$ENDPOINT apigateway put-integration \
-  --rest-api-id "$API_ID" \
-  --resource-id "$CONFIRM_ID" \
-  --http-method POST \
-  --type AWS_PROXY \
-  --integration-http-method POST \
-  --uri "arn:aws:apigateway:$REGION:lambda:path/2015-03-31/functions/$LAMBDA_ARN/invocations" \
-  --no-cli-pager >/dev/null
-
-# Deploy API to stage
-aws --endpoint-url=$ENDPOINT apigateway create-deployment \
-  --rest-api-id "$API_ID" \
-  --stage-name "local" \
-  --no-cli-pager >/dev/null
-
+# Auto-detect API URL
+API_ID=$(aws --endpoint-url=$ENDPOINT apigateway get-rest-apis \
+  --query "items[0].id" --output text 2>/dev/null || echo "")
 API_URL="$ENDPOINT/restapis/$API_ID/local/_user_request_"
-echo "✓ API Gateway deployed: $API_URL"
 
-# Quick smoke test
-echo "⟳ Running smoke test..."
 SMOKE_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$API_URL/fraud-check" \
   -H "Content-Type: application/json" \
-  -d '{"messageId":"smoke-test","debtorAccount":{"sortCode":"123456","accountNumber":"12345678","accountName":"Smoke Test"},"creditorAccount":{"sortCode":"654321","accountNumber":"87654321","accountName":"Test"},"amount":50.00,"currency":"GBP","paymentReference":"smoke","confirmationOfPayee":{"result":"MATCH","matchedName":"Test"},"channel":{"type":"MOBILE","deviceId":null,"geoLocation":null,"sessionDuration":null},"timestamp":"2024-01-01T00:00:00Z"}' \
+  -d '{"messageId":"smoke-test","debtorAccount":{"sortCode":"101010","accountNumber":"10000001","accountName":"Smoke Test"},"creditorAccount":{"sortCode":"505050","accountNumber":"50000001","accountName":"Test"},"amount":50.00,"currency":"GBP","paymentReference":"smoke","confirmationOfPayee":{"result":"MATCH","matchedName":"Test"},"channel":{"type":"MOBILE","deviceId":null,"geoLocation":null,"sessionDuration":null},"timestamp":"2024-01-01T00:00:00Z"}' \
   2>/dev/null || echo "000")
 
 if [ "$SMOKE_RESPONSE" = "200" ]; then
   echo "✓ Smoke test passed (HTTP 200)"
+  # Verify audit record was created by EventBridge -> AuditLogHandler
+  sleep 3
+  AUDIT_ITEM=$(aws --endpoint-url=$ENDPOINT dynamodb get-item \
+    --table-name "$TABLE_NAME" \
+    --key '{"pk": {"S": "AUDIT#smoke-test"}, "sk": {"S": "DECISION"}}' \
+    --query 'Item.decision.S' --output text 2>/dev/null || echo "NONE")
+  if [ "$AUDIT_ITEM" != "NONE" ] && [ "$AUDIT_ITEM" != "None" ]; then
+    echo "✓ EventBridge flow verified: audit record created (decision=$AUDIT_ITEM)"
+  else
+    echo "⚠ Audit record not found yet (EventBridge delivery may be delayed in LocalStack)"
+  fi
 else
   echo "⚠ Smoke test returned HTTP $SMOKE_RESPONSE (first Lambda invocation may be slow - cold start)"
   echo "  This is normal for Java Lambdas. Try again in a few seconds."
 fi
-
-# Seed test data
-echo "⟳ Seeding test data (100 profiles)..."
-bash "$PROJECT_ROOT/localstack/seed-data.sh" 2>&1 | tail -5
 
 ###############################################################################
 # STEP 7: Start development server
