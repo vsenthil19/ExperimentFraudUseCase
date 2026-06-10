@@ -364,6 +364,10 @@ else
   echo "  This is normal for Java Lambdas. Try again in a few seconds."
 fi
 
+# Seed test data
+echo "⟳ Seeding test data (100 profiles)..."
+bash "$PROJECT_ROOT/localstack/seed-data.sh" 2>&1 | tail -5
+
 ###############################################################################
 # STEP 7: Start development server
 ###############################################################################

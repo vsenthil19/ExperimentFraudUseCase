@@ -72,6 +72,7 @@ Environment variables (all optional):
 | `start-local.sh` | Complete setup from scratch |
 | `stop-local.sh` | Tear down the local environment |
 | `deploy.sh` | Deploy AWS resources only (assumes LocalStack is running) |
+| `seed-data.sh` | Populate DynamoDB with 100 test profiles |
 | `serve.py` | Dev server with API proxy |
 
 ## Troubleshooting
@@ -91,3 +92,40 @@ Set a different port: `PORT=9090 ./localstack/start-local.sh`
 ### LocalStack container won't start
 Check if the port is in use: `lsof -i :4566`
 Check Docker logs: `docker logs localstack`
+
+## Test Data
+
+Run `./localstack/seed-data.sh` to populate DynamoDB with 100 test records (80 customer profiles + 20 beneficiary entries). This is also called automatically by `start-local.sh` if you uncomment the seed line.
+
+### Test Accounts
+
+| Type | Sort Code | Account Number | Profile |
+|------|-----------|----------------|---------|
+| Debtor (low-risk) | `10-10-10` | `10000001` – `10000020` | High tx count (80-200), low mean (£200-£500) |
+| Debtor (medium-risk) | `20-20-20` | `20000001` – `20000020` | Moderate tx count (20-60), medium mean (£500-£1500) |
+| Debtor (high-value) | `30-30-30` | `30000001` – `30000020` | High tx count (50-150), high mean (£5000-£15000) |
+| Debtor (new customer) | `40-40-40` | `40000001` – `40000020` | Very low tx count (1-5), low mean (£100-£300) |
+| Creditor (clean) | `50-50-50` | `50000001` – `50000010` | Flag: NONE |
+| Creditor (high-risk) | `60-60-60` | `60000001` – `60000006` | Flag: HIGH_RISK |
+| Creditor (mule-linked) | `70-70-70` | `70000001` – `70000004` | Flag: MULE_LINKED |
+
+### Example Scenarios
+
+| Scenario | Debtor | Creditor | Amount | CoP | Expected |
+|----------|--------|----------|--------|-----|----------|
+| Routine payment | `10-10-10` / `10000001` | `50-50-50` / `50000001` | £150 | MATCH | ALLOW |
+| Large unusual payment | `20-20-20` / `20000001` | `50-50-50` / `50000002` | £5000 | MATCH | REVIEW |
+| New customer, risky creditor | `40-40-40` / `40000001` | `60-60-60` / `60000001` | £9500 | NO_MATCH | REVIEW/BLOCK |
+| High-value customer, normal payment | `30-30-30` / `30000001` | `50-50-50` / `50000003` | £8000 | MATCH | ALLOW |
+
+### Seeding Manually
+
+```bash
+# Seed after LocalStack is running
+./localstack/seed-data.sh
+
+# Verify item count
+AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
+  aws --endpoint-url=http://localhost:4566 --region us-east-1 \
+  dynamodb scan --table-name FraudDetection --select COUNT
+```
